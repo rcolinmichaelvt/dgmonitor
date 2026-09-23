@@ -6,7 +6,7 @@ const fs = require("fs");
 const path = require("path");
 const { fileURLToPath } = require("url");
 
-const WEBHOOK_URL = process.env.DG_WEBHOOK;;
+const WEBHOOK_URL = process.env.DG_WEBHOOK;
 
 // ── Config ──────────────────────────────────────────────────
 const CONFIG = {
