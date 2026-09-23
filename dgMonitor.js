@@ -6,7 +6,7 @@ const fs = require("fs");
 const path = require("path");
 const { fileURLToPath } = require("url");
 
-const WEBHOOK_URL = "https://discord.com/api/webhooks/1490869910799122462/BfDF6jdmCw-rJh9EaHIH8Znxm6hEhO2oYVBv3BuWnByaWqPmLZ4G1wAj0Dc3wb0stsag";
+const WEBHOOK_URL = process.env.DISCORD_WEBHOOK;;
 
 // ── Config ──────────────────────────────────────────────────
 const CONFIG = {
