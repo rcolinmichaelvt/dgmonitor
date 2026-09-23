@@ -515,18 +515,18 @@ async function skuLoop(sku, isFirst, startDelayMs) {
     pollCount++;
 
     // Send scheduled full summary (skip count 0 — startup already sends one)
-    if (pollCount > 0 && pollCount % summaryEveryN === 0) {
+    /*if (pollCount > 0 && pollCount % summaryEveryN === 0) {
       let stores;
       try {
         stores = await fetchInventory(sku);
       } catch (err) {
         if (err.message === "AUTH_EXPIRED") {
           await sleep(2000);
-          try { stores = await fetchInventory(sku); } catch { /* skip this summary */ }
+          try { stores = await fetchInventory(sku); } catch {}
         }
       }
       if (stores) await sendFullSummary(sku, stores);
-    }
+    }*/
 
     await sleep(CONFIG.pollInterval);
   }
