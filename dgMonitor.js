@@ -22,6 +22,7 @@ const CONFIG = {
     { upc: "196214152397", label: "Knockout Boxes" },
     { upc: "196214150669", label: "Poster Collections"},
     { upc: "820650105838", label: "Mini Tins" },
+    { upc: "196214141308", label: "Ascended Mini Tins?" },
     //{ upc: "820650850363", label: "Phantasmal Portfolios"},
     { upc: "196214152076", label: "AH Ex Boxes"},
     { upc: "820650801563", label: "Booster Packs"},
