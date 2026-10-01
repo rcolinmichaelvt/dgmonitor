@@ -19,6 +19,7 @@ const CONFIG = {
   skus: [
     { upc: "196214158801", label: "30th ETBs" },
     { upc: "196214158757", label: "30th Posters" },
+    { upc: "196214158726", label: "30th Ex Boxes" },
     { upc: "196214152397", label: "Knockout Boxes" },
     { upc: "196214150669", label: "Poster Collections"},
     { upc: "820650105838", label: "Mini Tins" },
@@ -233,7 +234,7 @@ async function sendFullSummary(sku, stores) {
   const inStockText  = inStock.length  > 0 ? buildStoreTable(inStock)  : "No stores currently in stock.";
   const outStockText = outStock.length > 0 ? buildStoreTable(outStock) : "All stores have stock!";
 
-  await sendWebhook({
+  /*await sendWebhook({
     username: USERNAME,
     avatar_url: AVATAR_URL,
     embeds: [{
@@ -247,7 +248,7 @@ async function sendFullSummary(sku, stores) {
       footer: { text: `Takeoff Monitors • Dollar General • UPC ${sku.upc}` },
       timestamp: new Date().toISOString(),
     }],
-  });
+  });*/
 
   console.log(`[${timestamp()}] [${sku.label}] Full summary sent.`);
 }
