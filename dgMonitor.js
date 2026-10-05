@@ -4,7 +4,6 @@
 
 const fs = require("fs");
 const path = require("path");
-const { fileURLToPath } = require("url");
 
 const WEBHOOK_URL = process.env.DG_WEBHOOK;
 
@@ -33,10 +32,12 @@ const CONFIG = {
   ],
 
   // How often to poll (ms)
-  pollInterval: 3 * 60 * 1000,          // 5 minutes
-
-  // How often to send a full stock summary (ms)
-  fullSummaryInterval: 6 * 60 * 60 * 1000, // 6 hours
+  pollInterval: 3 * 60 * 1000,          // normal: 3 minutes per SKU
+  fastPollInterval: 10 * 1000,          // recent restocks: 10 seconds per SKU
+  recentStockWindow: 3 * 24 * 60 * 60 * 1000,
+  requestTimeout: 25 * 1000,
+  maxObservationGap: 9 * 60 * 1000,     // longer gaps do not train predictions
+  timezone: "America/New_York",
 
   // Path to the persistent cache file (sits next to this script)
   cacheFile: path.join(__dirname, "dg-stock-cache.json"),
@@ -67,22 +68,26 @@ const API_URL     = "https://dggo.dollargeneral.com/omni/api/store/search/invent
 // ── In-memory state ──────────────────────────────────────────
 // stockState[upc][storeNumber] = { qty, address, city, state, distance, phoneNumber }
 const stockState = {};
+// Running aggregates cover ALL accepted episodes; history is a bounded audit log.
+let timing = { overall: null, byStore: {}, bySku: {}, byPair: {}, history: [] };
+let apiPauseUntil = 0;
+let refreshPromise = null;
 
 // ── Token refresh ────────────────────────────────────────────
-let isRefreshing = false; // prevent concurrent refresh calls
-
 async function refreshToken() {
-  if (isRefreshing) {
-    // Another SKU loop already triggered a refresh — wait for it to finish
-    await sleep(3000);
-    return;
+  if (!refreshPromise) {
+    refreshPromise = performTokenRefresh().finally(() => { refreshPromise = null; });
   }
-  isRefreshing = true;
+  return refreshPromise;
+}
+
+async function performTokenRefresh() {
   console.log(`[${timestamp()}] [Auth] Token expired — refreshing…`);
 
   try {
     const res = await fetch("https://www.dollargeneral.com/bin/dg/user?refreshCookies=true", {
       method: "GET",
+      signal: AbortSignal.timeout(CONFIG.requestTimeout),
       headers: {
         accept:                   "application/json, text/plain, */*",
         "accept-language":        "en-US,en;q=0.9",
@@ -126,31 +131,13 @@ async function refreshToken() {
   } catch (err) {
     console.error(`[${timestamp()}] [Auth] Token refresh failed: ${err.message}`);
     console.error(`[${timestamp()}] [Auth] ⚠️  You may need to update the cookie/session values in CONFIG.session manually.`);
-  } finally {
-    isRefreshing = false;
+    throw err;
   }
 }
 
 // ── Cache helpers ────────────────────────────────────────────
-/*
-  Cache file shape:
-  {
-    "lastSaved": "2026-04-06T14:26:35.000Z",
-    "state": {
-      "<upc>": {
-        "<storeNumber>": {
-          "qty": 2,
-          "address": "112 W Main St",
-          "city": "Blacksburg",
-          "state": "VA",
-          "distance": 0.4,
-          "phoneNumber": "5401234567"
-        }
-      }
-    }
-  }
-*/
-
+// Legacy { lastSaved, state } files remain valid. The next successful poll
+// adds schemaVersion, per-store timestamps/pendingRestock, and timing aggregates.
 function loadCache() {
   try {
     if (!fs.existsSync(CONFIG.cacheFile)) {
@@ -170,10 +157,14 @@ function loadCache() {
 function saveCache() {
   try {
     const payload = {
+      schemaVersion: 2,
       lastSaved: new Date().toISOString(),
       state: stockState,
+      timing,
     };
-    fs.writeFileSync(CONFIG.cacheFile, JSON.stringify(payload, null, 2), "utf8");
+    const temporary = `${CONFIG.cacheFile}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(payload, null, 2), "utf8");
+    fs.renameSync(temporary, CONFIG.cacheFile);
   } catch (err) {
     console.error(`[Cache] Failed to save: ${err.message}`);
   }
@@ -182,14 +173,14 @@ function saveCache() {
 // ── Helpers ──────────────────────────────────────────────────
 function timestamp() {
   return new Date().toLocaleString("en-US", {
-    month: "short", day: "2-digit", year: "numeric",
+    timeZone: CONFIG.timezone, month: "short", day: "2-digit", year: "numeric",
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true,
   });
 }
 
 function friendlyDate(isoString) {
   return new Date(isoString).toLocaleString("en-US", {
-    month: "short", day: "2-digit", year: "numeric",
+    timeZone: CONFIG.timezone, month: "short", day: "2-digit", year: "numeric",
     hour: "2-digit", minute: "2-digit", hour12: true,
   });
 }
@@ -200,13 +191,8 @@ function storeLabel(store) {
 
 function formatPhone(num) {
   if (!num) return "N/A";
+  num = String(num);
   return `(${num.slice(0, 3)}) ${num.slice(3, 6)}-${num.slice(6)}`;
-}
-
-function buildStoreTable(stores) {
-  return stores
-    .map((s) => `[${s.productQTY}]`.padEnd(5) + ` ${storeLabel(s)}`)
-    .join("\n");
 }
 
 // ── Discord helpers ──────────────────────────────────────────
@@ -214,6 +200,7 @@ async function sendWebhook(payload) {
   try {
     const res = await fetch(WEBHOOK_URL, {
       method: "POST",
+    signal: AbortSignal.timeout(CONFIG.requestTimeout),
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
@@ -226,34 +213,7 @@ async function sendWebhook(payload) {
   }
 }
 
-async function sendFullSummary(sku, stores) {
-  const inStock  = stores.filter((s) => s.productQTY > 0);
-  const outStock = stores.filter((s) => s.productQTY === 0);
-  const totalQty = stores.reduce((sum, s) => sum + s.productQTY, 0);
-
-  const inStockText  = inStock.length  > 0 ? buildStoreTable(inStock)  : "No stores currently in stock.";
-  const outStockText = outStock.length > 0 ? buildStoreTable(outStock) : "All stores have stock!";
-
-  /*await sendWebhook({
-    username: USERNAME,
-    avatar_url: AVATAR_URL,
-    embeds: [{
-      title: `📦 Full Stock Summary — ${sku.label}`,
-      description: `**${inStock.length}** store(s) in stock · **${totalQty}** total units · **${stores.length}** stores monitored`,
-      color: BRAND_COLOR,
-      fields: [
-        { name: `✅ In Stock (${inStock.length})`,   value: `\`\`\`\n${inStockText}\n\`\`\``,  inline: false },
-        { name: `❌ Out of Stock (${outStock.length})`, value: `\`\`\`\n${outStockText}\n\`\`\``, inline: false },
-      ],
-      footer: { text: `Takeoff Monitors • Dollar General • UPC ${sku.upc}` },
-      timestamp: new Date().toISOString(),
-    }],
-  });*/
-
-  console.log(`[${timestamp()}] [${sku.label}] Full summary sent.`);
-}
-
-async function sendStockChange(sku, store, oldQty, newQty) {
+async function sendStockChange(sku, store, oldQty, newQty, timingFields = []) {
   const increased = newQty > oldQty;
   const emoji = increased ? "🟢" : "🔴";
   const verb  = increased ? "Restock" : "Stock Drop";
@@ -270,6 +230,7 @@ async function sendStockChange(sku, store, oldQty, newQty) {
         { name: "Stock Change", value: `**${oldQty}** → **${newQty}**`, inline: true  },
         { name: "Distance",     value: `${store.distance} mi`,           inline: true  },
         { name: "Phone",        value: formatPhone(store.phoneNumber),    inline: true  },
+        ...timingFields,
       ],
       footer: { text: `Takeoff Monitors • Dollar General • UPC ${sku.upc}` },
       timestamp: new Date().toISOString(),
@@ -277,47 +238,6 @@ async function sendStockChange(sku, store, oldQty, newQty) {
   });
 
   console.log(`[${timestamp()}] [${sku.label}] CHANGE @ ${storeLabel(store)} — ${oldQty} → ${newQty}`);
-}
-
-// Grouped embed showing everything that changed while the bot was offline
-async function sendOfflineDiff(sku, changes, cacheAge) {
-  if (changes.length === 0) return;
-
-  const lines = changes.map(({ store, oldQty, newQty }) => {
-    const arrow = newQty > oldQty ? "🟢" : "🔴";
-    return `${arrow} ${storeLabel(store).padEnd(44)} ${oldQty} → ${newQty}`;
-  });
-
-  // Chunk into ≤980-char field values (Discord limit: 1024)
-  const chunks = [];
-  let current  = "";
-  for (const line of lines) {
-    const next = current ? current + "\n" + line : line;
-    if (next.length > 980) { chunks.push(current); current = line; }
-    else current = next;
-  }
-  if (current) chunks.push(current);
-
-  const fields = chunks.map((chunk, i) => ({
-    name:   i === 0 ? `Changes while offline (${changes.length})` : "\u200b",
-    value:  `\`\`\`\n${chunk}\n\`\`\``,
-    inline: false,
-  }));
-
-  await sendWebhook({
-    username: USERNAME,
-    avatar_url: AVATAR_URL,
-    embeds: [{
-      title: `⏰ Missed Changes — ${sku.label}`,
-      description: `Monitor was **offline**. Last known state was from **${cacheAge}**.`,
-      color: 0xfbbf24, // amber
-      fields,
-      footer: { text: `Takeoff Monitors • Dollar General • UPC ${sku.upc}` },
-      timestamp: new Date().toISOString(),
-    }],
-  });
-
-  console.log(`[${timestamp()}] [${sku.label}] Offline diff sent (${changes.length} change(s)).`);
 }
 
 // ── API fetch ────────────────────────────────────────────────
@@ -332,6 +252,7 @@ async function fetchInventory(sku) {
 
   const res = await fetch(API_URL, {
     method: "POST",
+    signal: AbortSignal.timeout(CONFIG.requestTimeout),
     headers: {
       accept:                   "application/json, text/plain, */*",
       "accept-language":        "en-US,en;q=0.9",
@@ -354,6 +275,13 @@ async function fetchInventory(sku) {
     },
     body: body.toString(),
   });
+
+
+  if (res.status === 429) {
+    const retry = retryAfterMs(res.headers.get("retry-after"));
+    apiPauseUntil = Math.max(apiPauseUntil, Date.now() + retry);
+    throw new Error(`RATE_LIMITED: paused for ${Math.ceil(retry / 1000)}s`);
+  }
 
   // Auth expired — refresh token and signal caller to retry
   if (res.status === 401 || res.status === 403) {
@@ -380,7 +308,155 @@ async function fetchInventory(sku) {
     throw new Error(`AUTH_EXPIRED`);
   }
 
-  return data.stores ?? [];
+  if (!Array.isArray(data.stores)) throw new Error("Invalid inventory response: stores array missing");
+  for (const store of data.stores) {
+    if (store.storeNumber == null || store.productQTY == null ||
+        String(store.productQTY).trim() === "" ||
+        !Number.isFinite(Number(store.productQTY)) || Number(store.productQTY) < 0) {
+      throw new Error("Invalid store number or quantity; previous state retained");
+    }
+    store.productQTY = Number(store.productQTY);
+  }
+  return data.stores;
+}
+
+// ── Timing model ─────────────────────────────────────────────
+// This measures observed restock -> first decrease, NOT physical unloading.
+// Returns, corrections, sales delay, and backend update delay can affect it.
+function retryAfterMs(value, now = Date.now()) {
+  if (!value) return 60_000;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(1000, seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(1000, date - now) : 60_000;
+}
+
+function duration(ms) {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return "<1 minute";
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const mins = minutes % 60;
+  return [days && `${days}d`, hours && `${hours}h`, mins && `${mins}m`].filter(Boolean).join(" ");
+}
+
+function addAggregate(current, ms) {
+  const a = current || { count: 0, totalMs: 0, minMs: ms, maxMs: ms };
+  a.count++;
+  a.totalMs += ms;
+  a.minMs = Math.min(a.minMs, ms);
+  a.maxMs = Math.max(a.maxMs, ms);
+  return a;
+}
+
+function recordSample(sample) {
+  const { upc, storeNumber, elapsedMs } = sample;
+  const pair = `${upc}:${storeNumber}`;
+  timing.overall = addAggregate(timing.overall, elapsedMs);
+  timing.byStore[storeNumber] = addAggregate(timing.byStore[storeNumber], elapsedMs);
+  timing.bySku[upc] = addAggregate(timing.bySku[upc], elapsedMs);
+  timing.byPair[pair] = addAggregate(timing.byPair[pair], elapsedMs);
+  timing.history.push(sample);
+  timing.history = timing.history.slice(-500);
+}
+
+function prediction(upc, storeNumber) {
+  const candidates = [
+    ["this product at this store", timing.byPair[`${upc}:${storeNumber}`]],
+    ["this store (all products)", timing.byStore[storeNumber]],
+    ["this product (all stores)", timing.bySku[upc]],
+    ["all products/stores", timing.overall],
+  ];
+  const chosen = candidates.find(([, a]) => a?.count >= 3) ||
+    candidates.find(([, a]) => a?.count > 0);
+  return chosen ? { scope: chosen[0], ...chosen[1], meanMs: chosen[1].totalMs / chosen[1].count } : null;
+}
+
+function predictionFields(upc, storeNumber, restockAt) {
+  const p = prediction(upc, storeNumber);
+  const global = timing.overall;
+  const detail = p
+    ? `Average: **${duration(p.meanMs)}** (${p.count} episodes; ${p.scope}).` +
+      `\nExpected first decrease: **${friendlyDate(new Date(restockAt + p.meanMs).toISOString())} ET**.` +
+      `\nObserved range: ${duration(p.minMs)}–${duration(p.maxMs)}.` +
+      (p.count < 3 ? "\nPreliminary: fewer than 3 episodes." : "") +
+      `\nOverall average: ${duration(global.totalMs / global.count)} (${global.count} episodes).`
+    : "Learning: no completed restock → first-decrease episodes yet.";
+  return [{ name: "Restock → first decrease estimate", value: detail +
+    "\nProxy only: includes buyer wait/update delay; shelf placement is unconfirmed.", inline: false }];
+}
+
+function isFastSku(sku, now = Date.now()) {
+  return Object.values(stockState[sku.upc] || {}).some((entry) => {
+    const at = Date.parse(entry.lastIncreaseAt);
+    return entry.qty > 0 && Number.isFinite(at) && at <= now && now - at < CONFIG.recentStockWindow;
+  });
+}
+
+// Pure state transition helper: tests can exercise this without live requests.
+function observeStore(sku, store, now = Date.now(), offline = false) {
+  const prev = stockState[sku.upc] ||= {};
+  const old = prev[store.storeNumber];
+  const oldQty = old?.qty ?? null;
+  const newQty = store.productQTY;
+  const iso = new Date(now).toISOString();
+  const entry = {
+    ...old, qty: newQty, address: store.address, city: store.city,
+    state: store.state, distance: store.distance, phoneNumber: store.phoneNumber,
+    lastObservedAt: iso,
+  };
+  prev[store.storeNumber] = entry;
+  const previousAt = Date.parse(old?.lastObservedAt);
+  const gap = now - previousAt;
+  if (entry.pendingRestock && (offline || !Number.isFinite(gap) ||
+      gap < 0 || gap > CONFIG.maxObservationGap)) {
+    entry.pendingRestock = { ...entry.pendingRestock, trainable: false };
+  }
+  // Baseline stock has no known arrival time: never invent a restock.
+  if (oldQty === null || oldQty === newQty) return null;
+  let fields = [];
+  if (newQty > oldQty) {
+    entry.lastIncreaseAt = iso;
+    // Group consecutive rises before the first decrease into one episode.
+    if (!entry.pendingRestock) {
+      entry.pendingRestock = {
+        detectedAt: iso,
+        previousObservedAt: old?.lastObservedAt || null,
+        trainable: !offline && Number.isFinite(gap) && gap >= 0 && gap <= CONFIG.maxObservationGap,
+        increases: 1,
+      };
+    } else {
+      entry.pendingRestock = { ...entry.pendingRestock, increases: entry.pendingRestock.increases + 1 };
+    }
+    fields = predictionFields(sku.upc, store.storeNumber, Date.parse(entry.pendingRestock.detectedAt));
+    if (entry.pendingRestock.increases > 1) fields.push({
+      name: "Restock episode", value: "Consecutive increases are grouped; estimate is anchored to the first observed increase.", inline: false,
+    });
+    fields.push({ name: "Monitoring", value: "10-second checks for 72 hours after the latest observed increase (while stock remains).", inline: false });
+    if (offline) fields.push({ name: "Timing uncertainty", value: "Increase happened while offline; arrival time is unknown and this episode will not train estimates.", inline: false });
+  } else if (entry.pendingRestock) {
+    const pending = entry.pendingRestock;
+    const start = Date.parse(pending.detectedAt);
+    const elapsedMs = now - start;
+    const usable = pending.trainable && !offline && Number.isFinite(elapsedMs) && elapsedMs >= 0;
+    if (usable) {
+      recordSample({
+        upc: sku.upc, storeNumber: String(store.storeNumber),
+        restockAt: pending.detectedAt, firstDecreaseAt: iso, elapsedMs,
+        // Bounds reflect polling uncertainty, not backend update delay.
+        minimumMs: Math.max(0, previousAt - start),
+        maximumMs: now - Date.parse(pending.previousObservedAt),
+        increases: pending.increases,
+      });
+    }
+    fields = [{ name: "First decrease after restock", value: usable
+      ? `**${duration(elapsedMs)}** after the first observed increase; added to averages.` +
+        (pending.increases > 1 ? `\nGrouped ${pending.increases} increases in this episode.` : "")
+      : "Timing excluded from averages because arrival time or continuous observations were missing.", inline: false },
+      { name: "Shelf signal", value: "Possible sale or inventory adjustment; shelf availability is unconfirmed.", inline: false }];
+    delete entry.pendingRestock;
+  }
+  return { store, oldQty, newQty, fields };
 }
 
 // ── Poll logic ───────────────────────────────────────────────
@@ -389,194 +465,105 @@ async function pollSku(sku, isFirst = false) {
   try {
     stores = await fetchInventory(sku);
   } catch (err) {
-    if (err.message === "AUTH_EXPIRED") {
-      // Token was just refreshed — wait a moment then retry once
-      console.log(`[${timestamp()}] [${sku.label}] Retrying after token refresh…`);
-      await sleep(2000);
-      try {
-        stores = await fetchInventory(sku);
-      } catch (retryErr) {
-        console.error(`[${timestamp()}] [${sku.label}] Retry failed: ${retryErr.message}`);
-        return;
-      }
-    } else {
-      console.error(`[${timestamp()}] [${sku.label}] Fetch error: ${err.message}`);
-      return;
-    }
+    if (err.message !== "AUTH_EXPIRED") throw err;
+    // One retry after the shared token refresh; scheduler handles further errors.
+    stores = await fetchInventory(sku);
   }
-
-  if (!stockState[sku.upc]) stockState[sku.upc] = {};
-  const prev = stockState[sku.upc];
-
-  if (isFirst) {
-    const cachedSkuState = sku._cachedState ?? null;
-    const cacheAge       = sku._cacheAge    ?? null;
-
-    if (cachedSkuState) {
-      // ── Resumed from cache: diff against live ──
-      const changes = [];
-
-      for (const store of stores) {
-        const entry  = cachedSkuState[store.storeNumber];
-        const oldQty = entry !== undefined ? entry.qty : null;
-        const newQty = store.productQTY;
-
-        if (oldQty !== null && oldQty !== newQty) {
-          changes.push({ store, oldQty, newQty });
-        }
-
-        prev[store.storeNumber] = {
-          qty:         newQty,
-          address:     store.address,
-          city:        store.city,
-          state:       store.state,
-          distance:    store.distance,
-          phoneNumber: store.phoneNumber,
-        };
-      }
-
-      if (changes.length > 0) {
-        await sendOfflineDiff(sku, changes, cacheAge);
-      } else {
-        console.log(`[${timestamp()}] [${sku.label}] Resumed — no changes since last run.`);
-      }
-    } else {
-      // ── Fresh start: no cache ──
-      for (const store of stores) {
-        prev[store.storeNumber] = {
-          qty:         store.productQTY,
-          address:     store.address,
-          city:        store.city,
-          state:       store.state,
-          distance:    store.distance,
-          phoneNumber: store.phoneNumber,
-        };
-      }
-    }
-
-    // Always send the opening full summary
-    await sendFullSummary(sku, stores);
-    saveCache();
-    return;
+  const now = Date.now();
+  const changes = stores.map((store) => observeStore(sku, store, now, isFirst))
+    .filter(Boolean);
+  // Persist before sending notifications, including observation times with no change.
+  saveCache();
+  for (const change of changes) {
+    await sendStockChange(sku, change.store, change.oldQty, change.newQty, change.fields);
   }
-
-  // ── Normal poll ──
-  let changed = false;
-  for (const store of stores) {
-    const entry  = prev[store.storeNumber];
-    const oldQty = entry ? entry.qty : null;
-    const newQty = store.productQTY;
-
-    if (oldQty === null) {
-      // Brand-new store appeared mid-run
-      prev[store.storeNumber] = {
-        qty: newQty, address: store.address, city: store.city,
-        state: store.state, distance: store.distance, phoneNumber: store.phoneNumber,
-      };
-      changed = true;
-    } else if (oldQty !== newQty) {
-      await sendStockChange(sku, store, oldQty, newQty);
-      prev[store.storeNumber].qty = newQty;
-      changed = true;
-    }
-  }
-
-  if (changed) saveCache();
-
-  console.log(
-    `[${timestamp()}] [${sku.label}] Polled ${stores.length} stores. ` +
-    `In stock: ${stores.filter((s) => s.productQTY > 0).length}`
-  );
+  console.log(`[${timestamp()}] [${sku.label}] ${stores.length} stores; ` +
+    `${stores.filter((s) => s.productQTY > 0).length} in stock; ` +
+    `${isFastSku(sku) ? "FAST 10s" : "NORMAL 180s"}`);
 }
 
 function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ── Per-SKU loop ─────────────────────────────────────────────
-// Each SKU runs its own independent loop:
-//   poll → wait 5 min → poll → wait 5 min → ...
-// Loops are staggered at startup so they never fire simultaneously.
-// Full summaries are tracked per-SKU by poll count.
+// ── Scheduler ────────────────────────────────────────────────
+// One slot per configured SKU in each 10-second frame, including idle slots.
+// Thus fast SKUs never collapse onto the same launch time when eligibility changes.
+// Normal SKUs use one slot every 18 frames (180s). Slow requests never overlap
+// for the same SKU, and missed slots are skipped instead of replayed in a burst.
+function shouldPoll(sku, runtime, cycle, now = Date.now()) {
+  const frames = Math.ceil(CONFIG.pollInterval / CONFIG.fastPollInterval);
+  return !runtime.busy && now >= runtime.retryAt && now >= apiPauseUntil &&
+    (isFastSku(sku, now) || cycle - runtime.lastCycle >= frames);
+}
 
-async function skuLoop(sku, isFirst, startDelayMs) {
-  // Stagger: wait before starting this SKU's loop
-  if (startDelayMs > 0) {
-    console.log(`[${timestamp()}] [${sku.label}] Starting in ${startDelayMs / 1000}s…`);
-    await sleep(startDelayMs);
-  }
-
-  let pollCount = 0;
-  const summaryEveryN = Math.round(CONFIG.fullSummaryInterval / CONFIG.pollInterval);
-
+async function runScheduler() {
+  const count = CONFIG.skus.length;
+  const slotMs = CONFIG.fastPollInterval / count;
+  const started = Date.now();
+  const runtimes = CONFIG.skus.map(() => ({ busy: false, initialized: false,
+    lastCycle: -Infinity, retryAt: 0, failures: 0 }));
+  let slot = 0;
   while (true) {
-    const thisIsFirst = isFirst && pollCount === 0;
-
-    // On the very first poll, if it's NOT the startup first-run, still handle normally
-    await pollSku(sku, thisIsFirst);
-    pollCount++;
-
-    // Send scheduled full summary (skip count 0 — startup already sends one)
-    /*if (pollCount > 0 && pollCount % summaryEveryN === 0) {
-      let stores;
-      try {
-        stores = await fetchInventory(sku);
-      } catch (err) {
-        if (err.message === "AUTH_EXPIRED") {
-          await sleep(2000);
-          try { stores = await fetchInventory(sku); } catch {}
-        }
-      }
-      if (stores) await sendFullSummary(sku, stores);
-    }*/
-
-    await sleep(CONFIG.pollInterval);
+    const target = started + slot * slotMs;
+    if (target > Date.now()) await sleep(target - Date.now());
+    slot = Math.max(slot, Math.floor((Date.now() - started) / slotMs));
+    const index = slot % count;
+    const cycle = Math.floor(slot / count);
+    const sku = CONFIG.skus[index];
+    const runtime = runtimes[index];
+    if (shouldPoll(sku, runtime, cycle)) {
+      runtime.busy = true;
+      runtime.lastCycle = cycle;
+      pollSku(sku, !runtime.initialized).then(() => {
+        runtime.initialized = true;
+        runtime.failures = 0;
+        runtime.retryAt = 0;
+      }).catch((err) => {
+        runtime.failures++;
+        const delay = Math.min(15 * 60_000, 30_000 * 2 ** Math.min(runtime.failures - 1, 5));
+        runtime.retryAt = Math.max(apiPauseUntil, Date.now() + delay);
+        // Retry on the next eligible slot AFTER backoff, even for a normal SKU.
+        runtime.lastCycle = -Infinity;
+        console.error(`[${timestamp()}] [${sku.label}] ${err.message}; retry in ${duration(delay)}.`);
+      }).finally(() => { runtime.busy = false; });
+    }
+    slot++;
   }
 }
 
 // ── Entry point ──────────────────────────────────────────────
 async function main() {
-  console.log("╔══════════════════════════════════════╗");
-  console.log("║   Takeoff Monitors — DG Pokémon      ║");
-  console.log("╚══════════════════════════════════════╝");
-  console.log(`SKUs monitored : ${CONFIG.skus.map((s) => s.label).join(", ")}`);
-  console.log(`Poll interval  : ${CONFIG.pollInterval / 1000}s per SKU`);
-  console.log(`Stagger        : ${CONFIG.pollInterval / 1000}s between SKUs`);
-  console.log(`Summary every  : ${CONFIG.fullSummaryInterval / 3600000}h`);
-  console.log(`Cache file     : ${CONFIG.cacheFile}`);
-  console.log(`Started        : ${timestamp()}\n`);
-
-  // Load cache and inject per-SKU saved state
+  if (!WEBHOOK_URL) throw new Error("Set DG_WEBHOOK before starting the monitor.");
+  const url = new URL(WEBHOOK_URL);
+  if (url.protocol !== "https:") throw new Error("DG_WEBHOOK must be an HTTPS URL.");
+  if (!CONFIG.skus.length) throw new Error("Configure at least one SKU.");
   const cache = loadCache();
-  if (cache?.state) {
-    const cacheAge = friendlyDate(cache.lastSaved);
-    for (const sku of CONFIG.skus) {
-      if (cache.state[sku.upc]) {
-        sku._cachedState = cache.state[sku.upc];
-        sku._cacheAge    = cacheAge;
-        console.log(`[Cache] [${sku.label}] ${Object.keys(cache.state[sku.upc]).length} stores restored.`);
-      }
+  if (cache?.state) Object.assign(stockState, cache.state);
+  if (cache?.timing) {
+    timing = { ...timing, ...cache.timing };
+  }
+  // Downtime may hide the real first decrease; never train across restarts.
+  for (const stores of Object.values(stockState)) {
+    for (const entry of Object.values(stores)) {
+      if (entry.pendingRestock) entry.pendingRestock.trainable = false;
     }
   }
-
-  console.log("");
-
-  // Launch one loop per SKU, each staggered by pollInterval
-  // e.g. with 2 SKUs and 5-min interval:
-  //   SKU 0 polls at t=0, 5, 10, 15 …
-  //   SKU 1 polls at t=5, 10, 15, 20 …
-  for (let i = 0; i < CONFIG.skus.length; i++) {
-    const sku          = CONFIG.skus[i];
-    const startDelayMs = i * CONFIG.pollInterval;
-    skuLoop(sku, true, startDelayMs); // intentionally not awaited — runs forever in background
-  }
-
-  // Save on clean exit
-  process.on("SIGINT",  () => { saveCache(); console.log("\n[Cache] Saved on exit."); process.exit(0); });
+  console.log(`Takeoff Monitors — ${CONFIG.skus.length} SKUs; normal 180s / recent 10s.`);
+  console.log(`Stagger: ${(CONFIG.fastPollInterval / CONFIG.skus.length / 1000).toFixed(3)}s per slot; times in Eastern.`);
+  console.log(`Timing history: ${timing.overall?.count || 0} completed episodes.`);
+  process.on("SIGINT", () => { saveCache(); process.exit(0); });
   process.on("SIGTERM", () => { saveCache(); process.exit(0); });
+  await runScheduler();
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Fatal error:", err.message);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { CONFIG, stockState, observeStore, isFastSku, prediction,
+  predictionFields, shouldPoll, retryAfterMs, pollSku, fetchInventory,
+  getTiming: () => timing };
