@@ -360,30 +360,42 @@ function recordSample(sample) {
   timing.history = timing.history.slice(-500);
 }
 
+// Every store uses only its own completed episodes across monitored products.
+// Existing timing.byStore cache data is reused; other stores are never a fallback.
 function prediction(upc, storeNumber) {
-  const candidates = [
-    ["this product at this store", timing.byPair[`${upc}:${storeNumber}`]],
-    ["this store (all products)", timing.byStore[storeNumber]],
-    ["this product (all stores)", timing.bySku[upc]],
-    ["all products/stores", timing.overall],
-  ];
-  const chosen = candidates.find(([, a]) => a?.count >= 3) ||
-    candidates.find(([, a]) => a?.count > 0);
-  return chosen ? { scope: chosen[0], ...chosen[1], meanMs: chosen[1].totalMs / chosen[1].count } : null;
+  const aggregate = timing.byStore[String(storeNumber)];
+  if (!aggregate || aggregate.count <= 0) return null;
+  return {
+    scope: "this store (all products)",
+    ...aggregate,
+    meanMs: aggregate.totalMs / aggregate.count,
+  };
 }
 
-function predictionFields(upc, storeNumber, restockAt) {
+function predictionFields(upc, storeNumber, restockAt, arrivalUnknown = false) {
   const p = prediction(upc, storeNumber);
-  const global = timing.overall;
-  const detail = p
-    ? `Average: **${duration(p.meanMs)}** (${p.count} episodes; ${p.scope}).` +
-      `\nExpected first decrease: **${friendlyDate(new Date(restockAt + p.meanMs).toISOString())} ET**.` +
-      `\nObserved range: ${duration(p.minMs)}–${duration(p.maxMs)}.` +
-      (p.count < 3 ? "\nPreliminary: fewer than 3 episodes." : "") +
-      `\nOverall average: ${duration(global.totalMs / global.count)} (${global.count} episodes).`
-    : "Learning: no completed restock → first-decrease episodes yet.";
-  return [{ name: "Restock → first decrease estimate", value: detail +
-    "\nProxy only: includes buyer wait/update delay; shelf placement is unconfirmed.", inline: false }];
+  const fields = [
+    { name: "This store's average — restock → first decrease",
+      value: p
+        ? `**${duration(p.meanMs)}** from **${p.count}** completed episode(s) at store **${storeNumber}**.` +
+          `\nAcross monitored products at this store.` +
+          `\nObserved range: ${duration(p.minMs)}–${duration(p.maxMs)}.` +
+          (p.count < 3 ? "\nPreliminary: fewer than 3 episodes." : "")
+        : `Learning: no completed episodes at store **${storeNumber}** yet.`,
+      inline: false },
+    { name: "Expected first stock decrease (Eastern time)",
+      value: !p
+        ? "Not available until this store has a completed restock → first-decrease episode."
+        : arrivalUnknown
+          ? "Unavailable: this increase occurred while offline, so its arrival time is unknown."
+          : `**${friendlyDate(new Date(restockAt + p.meanMs).toISOString())} ET**` +
+            `\nFirst observed increase + this store's average.`,
+      inline: false },
+    { name: "Estimate meaning",
+      value: "Restock → first decrease is a proxy; includes buyer wait/update delay. Shelf placement is unconfirmed.",
+      inline: false },
+  ];
+  return fields;
 }
 
 function isFastSku(sku, now = Date.now()) {
@@ -421,6 +433,7 @@ function observeStore(sku, store, now = Date.now(), offline = false) {
     if (!entry.pendingRestock) {
       entry.pendingRestock = {
         detectedAt: iso,
+        arrivalUnknown: offline,
         previousObservedAt: old?.lastObservedAt || null,
         trainable: !offline && Number.isFinite(gap) && gap >= 0 && gap <= CONFIG.maxObservationGap,
         increases: 1,
@@ -428,7 +441,7 @@ function observeStore(sku, store, now = Date.now(), offline = false) {
     } else {
       entry.pendingRestock = { ...entry.pendingRestock, increases: entry.pendingRestock.increases + 1 };
     }
-    fields = predictionFields(sku.upc, store.storeNumber, Date.parse(entry.pendingRestock.detectedAt));
+    fields = predictionFields(sku.upc, store.storeNumber, Date.parse(entry.pendingRestock.detectedAt), offline || entry.pendingRestock.arrivalUnknown === true);
     if (entry.pendingRestock.increases > 1) fields.push({
       name: "Restock episode", value: "Consecutive increases are grouped; estimate is anchored to the first observed increase.", inline: false,
     });
